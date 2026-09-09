@@ -63,7 +63,6 @@ export class DataEngine {
 
     const frescuraFactor = Math.max(0, 1.0 - (diasDesdeUltimo / 365.0));
     const scoreFrescura = frescuraFactor * 30;
-
     const scoreConfirmaciones = Math.min(30, unicosObservadores * 10);
 
     return Math.round(scoreCompletitud + scoreFrescura + scoreConfirmaciones);
@@ -73,30 +72,32 @@ export class DataEngine {
     const extractedData = await qvacService.parseObservation(rawText);
     const { cliente, observaciones } = extractedData;
 
-    let stmtCliente = this.db.prepare(`SELECT id FROM clientes WHERE nombre = ? AND ciudad = ?`);
-    let clienteRecord = stmtCliente.get(cliente.nombre, cliente.ciudad || 'Desconocido');
+    if (!observaciones || observaciones.length === 0) {
+      return { status: 'no_data_extracted' };
+    }
+
+    // Coincidencia flexible por ciudad o por fragmento de nombre
+    let clienteRecord = this.db.prepare(`
+      SELECT id FROM clientes 
+      WHERE ciudad LIKE ? OR nombre LIKE ?
+    `).get(`%${cliente.ciudad}%`, `%${cliente.nombre}%`);
 
     let clienteId;
-    if (!clienteRecord) {
+    if (clienteRecord) {
+      clienteId = clienteRecord.id;
+      this.db.prepare(`UPDATE clientes SET ultima_actualizacion = CURRENT_TIMESTAMP WHERE id = ?`).run(clienteId);
+    } else {
       const insertCliente = this.db.prepare(`
         INSERT INTO clientes (nombre, pais, ciudad) VALUES (?, ?, ?)
       `);
-      const result = insertCliente.run(
-        cliente.nombre, 
-        cliente.pais || 'Panamá', 
-        cliente.ciudad || 'Panamá'
-      );
+      const result = insertCliente.run(cliente.nombre, cliente.pais || 'Panamá', cliente.ciudad || 'Desconocido');
       clienteId = result.lastInsertRowid;
-    } else {
-      clienteId = clienteRecord.id;
-      this.db.prepare(`UPDATE clientes SET ultima_actualizacion = CURRENT_TIMESTAMP WHERE id = ?`).run(clienteId);
     }
 
-    const insertObs = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO observaciones (cliente_id, usuario_reporta, transcriptor_raw, nivel_confianza_observacion)
       VALUES (?, ?, ?, ?)
-    `);
-    insertObs.run(clienteId, usuario, rawText, 80.0);
+    `).run(clienteId, usuario, rawText, 85.0);
 
     for (const item of observaciones) {
       const equipoExistente = this.db.prepare(`
@@ -108,7 +109,7 @@ export class DataEngine {
         const nuevaCantidad = Math.max(equipoExistente.cantidad, item.cantidad || 1);
         const nuevaMarca = (equipoExistente.marca === 'Desconocido') ? (item.marca || 'Desconocido') : equipoExistente.marca;
         const nuevoModelo = (equipoExistente.modelo === 'Desconocido') ? (item.modelo || 'Desconocido') : equipoExistente.modelo;
-        const nuevaAntiguedad = item.antiguedad_estimada !== undefined && item.antiguedad_estimada !== null 
+        const nuevaAntiguedad = item.antiguedad_estimada !== null && item.antiguedad_estimada !== undefined
           ? item.antiguedad_estimada 
           : equipoExistente.antiguedad_estimada;
 
@@ -141,7 +142,7 @@ export class DataEngine {
           item.modelo || 'Desconocido',
           item.cantidad || 1,
           item.antiguedad_estimada || null,
-          item.estado_confirmacion || 'Estimado',
+          'Reportado',
           puntaje
         );
         equipoId = res.lastInsertRowid;
@@ -155,17 +156,16 @@ export class DataEngine {
 
   generateFollowUpQuestions(equipoId, item) {
     if (!item.marca || item.marca === 'Desconocido') {
-      this.db.prepare(`
-        INSERT INTO preguntas_seguimiento (equipo_id, dato_faltante, pregunta_generada)
-        VALUES (?, 'marca', '¿Conoces el fabricante o marca del equipo observado?')
-      `).run(equipoId);
-    }
+      const existePregunta = this.db.prepare(`
+        SELECT id FROM preguntas_seguimiento WHERE equipo_id = ? AND dato_faltante = 'marca' AND respondida = 0
+      `).get(equipoId);
 
-    if (item.antiguedad_estimada && item.antiguedad_estimada >= 7 && (!item.modelo || item.modelo === 'Desconocido')) {
-      this.db.prepare(`
-        INSERT INTO preguntas_seguimiento (equipo_id, dato_faltante, pregunta_generada)
-        VALUES (?, 'modelo', 'Al ser un equipo de más de 7 años, ¿cuál es el modelo exacto para evaluar su renovación?')
-      `).run(equipoId);
+      if (!existePregunta) {
+        this.db.prepare(`
+          INSERT INTO preguntas_seguimiento (equipo_id, dato_faltante, pregunta_generada)
+          VALUES (?, 'marca', '¿Conoces el fabricante o marca del equipo observado?')
+        `).run(equipoId);
+      }
     }
   }
 
@@ -177,7 +177,14 @@ export class DataEngine {
       JOIN clientes c ON e.cliente_id = c.id
     `).all();
     const oportunidades = equipos.filter(e => e.antiguedad_estimada >= 7);
+    
+    const preguntas = this.db.prepare(`
+      SELECT p.*, e.cliente_id, e.modalidad 
+      FROM preguntas_seguimiento p
+      JOIN equipos e ON p.equipo_id = e.id
+      WHERE p.respondida = 0
+    `).all();
 
-    return { clientes, equipos, oportunidades };
+    return { clientes, equipos, oportunidades, preguntas };
   }
 }

@@ -9,12 +9,6 @@ const engine = new DataEngine();
 app.use(cors());
 app.use(express.json());
 
-// Ruta raíz para confirmar que el backend está activo
-app.get('/', (req, res) => {
-  res.send('🚀 Backend de Philips Installed Base Intelligence corriendo correctamente en Express.');
-});
-
-// Endpoint para obtener los datos del Dashboard
 app.get('/api/dashboard', (req, res) => {
   try {
     const data = engine.getDashboardData();
@@ -24,13 +18,15 @@ app.get('/api/dashboard', (req, res) => {
   }
 });
 
-// Endpoint para procesar una nueva observación
 app.post('/api/observation', async (req, res) => {
   try {
     const { text, user } = req.body;
+    console.log("📥 Texto recibido:", text);
     const result = await engine.processIncomingObservation(text, user || 'Usuario_UI');
+    console.log("✅ Resultado procesamiento:", result);
     res.json(result);
   } catch (error) {
+    console.error("💥 ERROR DETALLADO EN EXPRESS:", error);
     res.status(500).json({ error: error.message });
   }
 });
