@@ -9,6 +9,7 @@ export class DataEngine {
   }
 
   initDatabase() {
+    this.db.pragma('foreign_keys = ON');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS clientes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +53,11 @@ export class DataEngine {
         FOREIGN KEY (equipo_id) REFERENCES equipos(id) ON DELETE CASCADE
       );
     `);
+    // Support databases created by the earlier, incompatible schema.
+    const clientColumns = this.db.prepare('PRAGMA table_info(clientes)').all().map(column => column.name);
+    if (!clientColumns.includes('pais')) this.db.exec("ALTER TABLE clientes ADD COLUMN pais TEXT NOT NULL DEFAULT 'Desconocido'");
+    if (!clientColumns.includes('ciudad')) this.db.exec("ALTER TABLE clientes ADD COLUMN ciudad TEXT NOT NULL DEFAULT 'Desconocido'");
+    if (!clientColumns.includes('ultima_actualizacion')) this.db.exec('ALTER TABLE clientes ADD COLUMN ultima_actualizacion DATETIME');
   }
 
   calculateConfidence(equipo, unicosObservadores = 1, diasDesdeUltimo = 0) {
@@ -69,6 +75,7 @@ export class DataEngine {
   }
 
   async processIncomingObservation(rawText, usuario = 'Usuario_Campo') {
+    if (typeof rawText !== 'string' || !rawText.trim()) throw new Error('La observacion debe contener texto.');
     const extractedData = await qvacService.parseObservation(rawText);
     const { cliente, observaciones } = extractedData;
 
@@ -76,11 +83,19 @@ export class DataEngine {
       return { status: 'no_data_extracted' };
     }
 
-    // Coincidencia flexible por ciudad o por fragmento de nombre
+    // A second note from the same user may omit the hospital; never invent one.
+    const resolvedClient = cliente || this.db.prepare(`
+      SELECT c.nombre, c.ciudad, c.pais FROM observaciones o
+      JOIN clientes c ON c.id = o.cliente_id
+      WHERE o.usuario_reporta = ? ORDER BY o.fecha_observacion DESC, o.id DESC LIMIT 1
+    `).get(usuario);
+    if (!resolvedClient) return { status: 'client_not_identified', message: 'Indica el hospital, ciudad o pais en la primera observacion.' };
+
+    // Match full identity: city-only matching could merge distinct hospitals.
     let clienteRecord = this.db.prepare(`
       SELECT id FROM clientes 
-      WHERE ciudad LIKE ? OR nombre LIKE ?
-    `).get(`%${cliente.ciudad}%`, `%${cliente.nombre}%`);
+      WHERE lower(nombre) = lower(?) AND lower(pais) = lower(?) AND lower(ciudad) = lower(?)
+    `).get(resolvedClient.nombre, resolvedClient.pais || 'Desconocido', resolvedClient.ciudad || 'Desconocido');
 
     let clienteId;
     if (clienteRecord) {
@@ -90,7 +105,7 @@ export class DataEngine {
       const insertCliente = this.db.prepare(`
         INSERT INTO clientes (nombre, pais, ciudad) VALUES (?, ?, ?)
       `);
-      const result = insertCliente.run(cliente.nombre, cliente.pais || 'Panamá', cliente.ciudad || 'Desconocido');
+      const result = insertCliente.run(resolvedClient.nombre, resolvedClient.pais || 'Desconocido', resolvedClient.ciudad || 'Desconocido');
       clienteId = result.lastInsertRowid;
     }
 
@@ -142,19 +157,27 @@ export class DataEngine {
           item.modelo || 'Desconocido',
           item.cantidad || 1,
           item.antiguedad_estimada || null,
-          'Reportado',
+          item.estado_confirmacion || 'Reportado',
           puntaje
         );
         equipoId = res.lastInsertRowid;
       }
 
-      this.generateFollowUpQuestions(equipoId, item);
+      const persistedEquipment = this.db.prepare('SELECT marca, modelo, antiguedad_estimada FROM equipos WHERE id = ?').get(equipoId);
+      this.syncFollowUpQuestions(equipoId, persistedEquipment);
     }
 
-    return { status: 'success', clienteId };
+    return { status: 'success', clienteId, extractionSource: extractedData.source };
   }
 
-  generateFollowUpQuestions(equipoId, item) {
+  syncFollowUpQuestions(equipoId, item) {
+    if (item.marca && item.marca !== 'Desconocido') {
+      this.db.prepare(`
+        UPDATE preguntas_seguimiento SET respondida = 1
+        WHERE equipo_id = ? AND dato_faltante = 'marca' AND respondida = 0
+      `).run(equipoId);
+      return;
+    }
     if (!item.marca || item.marca === 'Desconocido') {
       const existePregunta = this.db.prepare(`
         SELECT id FROM preguntas_seguimiento WHERE equipo_id = ? AND dato_faltante = 'marca' AND respondida = 0

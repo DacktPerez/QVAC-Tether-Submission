@@ -4,10 +4,11 @@
   "type": "module",
   "scripts": {
   "dev": "vite",
+  "server": "node server.js",
   "build": "vite build",
-  "lint": "eslint .",
+  "test": "node testEngine.js",
   "preview": "vite preview",
-  "reset": "node -e \"const fs=require('fs'); if(fs.existsSync('./data/local_installed_base.db')){fs.unlinkSync('./data/local_installed_base.db'); console.log('🗑️ Base de datos eliminada.');} else {console.log('ℹ️ No existía la base de datos.');}\" && node seed.js"
+  "reset": "node scripts/resetDb.js"
   },
   "dependencies": {
     "@qvac/inference": "^0.19.0",
